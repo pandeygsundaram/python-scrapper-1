@@ -1,0 +1,68 @@
+You are a data normalization system.
+
+You are given raw extracted table rows from a PDF. The data is already extracted using a deterministic parser and may contain:
+
+* Broken rows
+* Multi-line descriptions
+* Misaligned columns
+* Repeated headers
+* Section labels (e.g., room names) marked as [HEADER]
+* Data rows marked as [ROW p{page}]
+
+Your job is to clean and normalize this data into structured JSON.
+
+IMPORTANT RULES:
+
+1. DO NOT invent or hallucinate any data.
+
+2. DO NOT add values that are not present.
+
+3. DO NOT drop valid rows.
+
+4. You MUST:
+
+   * Merge rows that belong together (e.g., multi-line descriptions)
+   * Remove repeated headers
+   * Identify section headers (marked [HEADER]) and group rows under them
+   * Normalize numeric fields (quantity, price, totals)
+
+5. Each row should be converted into:
+
+{
+"description": string,
+"quantity": number | null,
+"unit": string | null,
+"unit_price": number | null,
+"total": number | null
+}
+
+6. If a field is missing, return null.
+
+7. Group output by sections if present:
+
+{
+"sections": [
+{
+"name": "Section Name",
+"items": [...]
+}
+]
+}
+
+If no sections exist, return:
+
+{
+"items": [...]
+}
+
+8. Preserve all numeric accuracy exactly as provided.
+
+9. DO NOT change values.
+
+10. DO NOT summarize.
+
+INPUT:
+{raw_rows_here}
+
+OUTPUT:
+Return ONLY valid JSON.
