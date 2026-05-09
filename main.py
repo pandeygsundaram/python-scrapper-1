@@ -6,9 +6,10 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Security, Depends
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import dotenv
 
@@ -18,6 +19,16 @@ from smart_extractor import run_smart_extraction
 from pipeline.run_pipeline import run_pipeline
 
 dotenv.load_dotenv()
+
+PYTHON_SERVICE_API_KEY = os.environ.get("PYTHON_SERVICE_API_KEY", "")
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(key: str = Security(_api_key_header)):
+    if not PYTHON_SERVICE_API_KEY:
+        raise HTTPException(status_code=500, detail="Service API key not configured")
+    if key != PYTHON_SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 app = FastAPI()
 
@@ -30,6 +41,8 @@ app.add_middleware(
 
 UPLOADS_DIR = Path(os.getcwd()) / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
+
+TEST_PDFS_DIR = Path(os.getcwd()) / "test-pdfs"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
@@ -115,7 +128,7 @@ async def run_extraction(job_id: str, pdf_path: str):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.post("/api/extract")
+@app.post("/api/extract", dependencies=[Depends(require_api_key)])
 async def extract(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
     if pdf.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -143,12 +156,12 @@ async def extract(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)
     return {"jobId": job_id, "status": job["status"], "fileName": job["fileName"]}
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=[Depends(require_api_key)])
 def list_jobs():
     return cache.list_jobs()
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_api_key)])
 def get_job(job_id: str):
     job = cache.get(job_id)
     if not job:
@@ -156,7 +169,7 @@ def get_job(job_id: str):
     return job
 
 
-@app.get("/api/jobs/{job_id}/result")
+@app.get("/api/jobs/{job_id}/result", dependencies=[Depends(require_api_key)])
 def get_result(job_id: str):
     job = cache.get(job_id)
     if not job:
@@ -193,7 +206,7 @@ def get_pdf(job_id: str):
     return FileResponse(pdf_path, media_type="application/pdf", filename=job["fileName"])
 
 
-@app.delete("/api/jobs/{job_id}")
+@app.delete("/api/jobs/{job_id}", dependencies=[Depends(require_api_key)])
 def delete_job(job_id: str):
     if not cache.delete(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -271,7 +284,7 @@ async def run_v2_extraction(job_id: str, pdf_path: str):
         })
 
 
-@app.post("/api/v2/extract")
+@app.post("/api/v2/extract", dependencies=[Depends(require_api_key)])
 async def v2_extract(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
     if pdf.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -515,6 +528,7 @@ def get_all_stages(job_id: str):
         ("text", "_01_text.json"),
         ("segments", "_02_segments.json"),
         ("rows", "_03_rows.json"),
+        ("extraction", "_03b_extraction.json"),
         ("blocks", "_04_blocks.json"),
         ("structured", "_05_structured.json"),
         ("final", "_FINAL.json"),
@@ -528,6 +542,51 @@ def get_all_stages(job_id: str):
         else:
             stages[key] = None
     return stages
+
+
+# ── Test PDFs ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/test-pdfs")
+def list_test_pdfs():
+    """List all PDFs available in the test-pdfs directory."""
+    if not TEST_PDFS_DIR.exists():
+        return []
+    files = sorted(
+        f.name for f in TEST_PDFS_DIR.iterdir()
+        if f.suffix.lower() == ".pdf"
+    )
+    return [{"name": f, "path": str(TEST_PDFS_DIR / f)} for f in files]
+
+
+@app.post("/api/v2/run-test-pdf")
+async def run_test_pdf(background_tasks: BackgroundTasks, body: dict):
+    """Kick off the v2 pipeline on a named file from test-pdfs/."""
+    filename = body.get("filename", "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename required")
+
+    src = TEST_PDFS_DIR / filename
+    if not src.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+
+    job_id = str(uuid.uuid4())
+    dest = UPLOADS_DIR / f"{job_id}-{filename}"
+    import shutil
+    shutil.copy2(src, dest)
+
+    job = cache.create({
+        "id": job_id,
+        "status": "pending",
+        "fileName": filename,
+        "fileSize": src.stat().st_size,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "pdfPath": str(dest),
+        "pipeline": "v2",
+        "progress": {"stage": "Queued", "detail": "Waiting to start..."},
+    })
+
+    background_tasks.add_task(run_v2_extraction, job_id, str(dest))
+    return {"jobId": job_id, "status": "pending", "fileName": filename, "pipeline": "v2"}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
