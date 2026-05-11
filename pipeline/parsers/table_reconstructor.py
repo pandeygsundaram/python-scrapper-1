@@ -254,3 +254,21 @@ def extract_rows_from_subsection(
         f"{len(all_rows)} rows extracted"
     )
     return all_rows
+
+
+def extract_rows_from_segment(segment: dict, pdf_path: str) -> list[dict]:
+    """
+    Extract all rows from a segment by iterating over its sub-sections.
+    Called by run_pipeline for each detected segment.
+    """
+    column_schema = segment.get("column_schema")
+    sub_sections = segment.get("sub_sections") or [{
+        "name": "Main",
+        "start_page": segment["start_page"],
+        "end_page": segment["end_page"],
+    }]
+    all_rows: list[dict] = []
+    for sub in sub_sections:
+        rows = extract_rows_from_subsection(sub, pdf_path, column_schema)
+        all_rows.extend(rows)
+    return all_rows

@@ -27,6 +27,8 @@ _PROMPT_FILES = {
     "default":               "line_items_agent.txt",
 }
 
+_V3_LINE_ITEMS_PROMPT = "line_items_v3_agent.txt"
+
 
 class StructuringAgent:
     """
@@ -50,6 +52,7 @@ class StructuringAgent:
         for table_type, fname in _PROMPT_FILES.items():
             path = _PROMPTS_DIR / fname
             self._prompts[table_type] = path.read_text()
+        self._v3_line_items_prompt = (_PROMPTS_DIR / _V3_LINE_ITEMS_PROMPT).read_text()
         logger.info(f"StructuringAgent ready (model={model_name}, {len(self._prompts)} prompt(s))")
 
     def _get_prompt_template(self, table_type: str) -> str:
@@ -238,3 +241,104 @@ class StructuringAgent:
                     logger.error(f"[{table_type}/{section_name}] gave up: {e}")
 
         return {"table_type": table_type, "section": section_name, "items": []}
+
+    async def structure_subsection_v3(
+        self,
+        blocks: list[dict],
+        column_schema: list[str],
+        section_name: str,
+        number_range: dict | None = None,
+        context_before: list[dict] | None = None,
+        context_after: list[dict] | None = None,
+    ) -> dict:
+        """
+        V3 line-items structuring — V2 block extraction, lean prompt returning
+        only item_number + description.
+
+        Args:
+            blocks         : V2 blocks for this sub-section
+            column_schema  : column headers from Agent 1
+            section_name   : sub-section label
+            number_range   : {"start": N, "end": M} from Agent 1
+            context_before : boundary blocks before this sub-section
+            context_after  : boundary blocks after this sub-section
+        """
+        if not blocks:
+            logger.warning(f"[v3/{section_name}] No blocks — returning empty")
+            return {"table_type": "line_items", "section": section_name, "items": []}
+
+        parts = []
+        if context_before:
+            parts.append(self._blocks_to_text(context_before, tag="CONTEXT_BEFORE"))
+        parts.append(self._blocks_to_text(blocks))
+        if context_after:
+            parts.append(self._blocks_to_text(context_after, tag="CONTEXT_AFTER"))
+        raw_text = "\n".join(parts)
+
+        schema_str = " | ".join(column_schema) if column_schema else "unknown"
+
+        if isinstance(number_range, list) and len(number_range) == 2:
+            number_range = {"start": number_range[0], "end": number_range[1]}
+
+        if number_range and isinstance(number_range, dict):
+            nr_start = number_range.get("start")
+            nr_end = number_range.get("end")
+            nr_count = nr_end - nr_start + 1
+            number_range_block = (
+                f"ITEM COUNT GUIDANCE: This section is expected to contain {nr_count} items "
+                f"(numbers {nr_start} through {nr_end}).\n"
+                f"Each new integer in range {nr_start}–{nr_end} at the start of a row = new item."
+            )
+            line_items_rules = (
+                f"7. Expected item numbers: {nr_start}–{nr_end}. "
+                f"Each integer in that range at row start = one item."
+            )
+        else:
+            number_range_block = ""
+            line_items_rules = ""
+
+        prompt = (
+            self._v3_line_items_prompt
+            .replace("{section_name_here}", section_name)
+            .replace("{column_schema_here}", schema_str)
+            .replace("{number_range_block}", number_range_block)
+            .replace("{line_items_rules}", line_items_rules)
+            .replace("{raw_rows_here}", raw_text)
+        )
+
+        logger.info(
+            f"[v3/{section_name}] Structuring {len(blocks)} blocks "
+            f"({sum(1 for b in blocks if b['type'] == 'data')} data rows)..."
+        )
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                response = await asyncio.to_thread(
+                    self.model.generate_content, prompt
+                )
+                if not response.candidates or not response.candidates[0].content.parts:
+                    raise ValueError("Empty response from model")
+                raw = response.candidates[0].content.parts[0].text.strip()
+                try:
+                    result = json.loads(raw)
+                except json.JSONDecodeError:
+                    result = json.loads(repair_json(raw))
+                if isinstance(result, list):
+                    result = {"items": result}
+                items = result.get("items", [])
+                result["table_type"] = "line_items"
+                result["section"] = section_name
+                logger.info(f"[v3/{section_name}] Done — {len(items)} item(s)")
+                return result
+            except Exception as e:
+                delay = _BASE_DELAY * (2 ** (attempt - 1))
+                if attempt < _MAX_RETRIES:
+                    logger.warning(
+                        f"[v3/{section_name}] Attempt {attempt}/{_MAX_RETRIES} "
+                        f"failed: {e} — retrying in {delay:.0f}s"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[v3/{section_name}] gave up: {e}")
+
+        return {"table_type": "line_items", "section": section_name, "items": []}

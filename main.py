@@ -17,6 +17,8 @@ import cache
 import pdf_parser
 from smart_extractor import run_smart_extraction
 from pipeline.run_pipeline import run_pipeline
+from pipeline.run_pipeline_v3 import run_pipeline_v3
+from db.database import init_db
 
 dotenv.load_dotenv()
 
@@ -31,6 +33,12 @@ async def require_api_key(key: str = Security(_api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -310,6 +318,105 @@ async def v2_extract(background_tasks: BackgroundTasks, pdf: UploadFile = File(.
 
     background_tasks.add_task(run_v2_extraction, job_id, pdf_path)
     return {"jobId": job_id, "status": job["status"], "fileName": job["fileName"], "pipeline": "v2"}
+
+
+# ── V3: Color-anchor pipeline ─────────────────────────────────────────────────
+
+async def run_v3_extraction(job_id: str, pdf_path: str):
+    try:
+        cache.update(job_id, {
+            "status": "processing",
+            "progress": {"stage": "Loading PDF", "detail": "Starting v3 pipeline..."},
+        })
+
+        output = await run_pipeline_v3(
+            pdf_path=pdf_path,
+            api_key=GEMINI_API_KEY,
+            model_name=GEMINI_MODEL,
+            output_dir="pipeline_output",
+            debug=True,
+        )
+
+        data = output.get("data", {})
+        sections = data.get("sections", [])
+        items = data.get("items", [])
+        all_items = [i for s in sections for i in s.get("items", [])] if sections else items
+        total_value = sum(i.get("total") or 0 for i in all_items)
+
+        source_name = Path(pdf_path).name
+        if "-" in source_name:
+            parts = source_name.split("-", 5)
+            if len(parts) == 6:
+                source_name = parts[5]
+
+        result = {
+            "source": source_name,
+            "pageRange": output.get("page_range", ""),
+            "extractedAt": output.get("extracted_at"),
+            "extractionMode": "v3-color-anchor",
+            "pipelineVersion": "v3",
+            "segmentsDetected": output.get("segments_detected", 0),
+            "confidence": output.get("confidence", 0),
+            "data": data,
+            "items": [
+                {
+                    "name": i.get("description"),
+                    "price": i.get("total"),
+                    "quantity": i.get("quantity"),
+                    "unit": i.get("unit"),
+                    "unitPrice": i.get("unit_price"),
+                    "extractionMethod": "v3-pipeline",
+                    "confidence": output.get("confidence", 0),
+                }
+                for i in all_items
+            ],
+            "totalItems": len(all_items),
+            "totalValue": total_value,
+        }
+
+        cache.save_result(job_id, result)
+        cache.update(job_id, {
+            "status": "done",
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+            "totalItems": len(all_items),
+            "totalValue": total_value,
+            "progress": {"stage": "Done", "detail": f"{len(all_items)} items extracted (v3)"},
+        })
+
+    except Exception as err:
+        cache.update(job_id, {
+            "status": "error",
+            "error": str(err),
+            "progress": {"stage": "Error", "detail": str(err)},
+        })
+
+
+@app.post("/api/v3/extract", dependencies=[Depends(require_api_key)])
+async def v3_extract(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
+    if pdf.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    job_id = str(uuid.uuid4())
+    filename = f"{job_id}-{pdf.filename}"
+    pdf_path = str(UPLOADS_DIR / filename)
+
+    contents = await pdf.read()
+    with open(pdf_path, "wb") as f:
+        f.write(contents)
+
+    job = cache.create({
+        "id": job_id,
+        "status": "pending",
+        "fileName": pdf.filename,
+        "fileSize": len(contents),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "pdfPath": pdf_path,
+        "pipeline": "v3",
+        "progress": {"stage": "Queued", "detail": "Waiting to start..."},
+    })
+
+    background_tasks.add_task(run_v3_extraction, job_id, pdf_path)
+    return {"jobId": job_id, "status": job["status"], "fileName": job["fileName"], "pipeline": "v3"}
 
 
 # ── V2: Pipeline Inspection Endpoints ────────────────────────────────────────

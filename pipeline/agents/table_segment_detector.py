@@ -81,7 +81,7 @@ class TableSegmentDetector:
                 response = await asyncio.to_thread(
                     self.model.generate_content, prompt
                 )
-                raw = response.text.strip()
+                raw = response.candidates[0].content.parts[0].text.strip()
                 logger.debug(f"Agent 1 raw:\n{raw[:800]}")
 
                 parsed = json.loads(raw)

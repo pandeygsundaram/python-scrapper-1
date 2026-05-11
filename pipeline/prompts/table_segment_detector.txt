@@ -1,60 +1,89 @@
-You are a document structure analysis system.
+You are a document structure analysis system for construction estimate PDFs.
 
-You are given the full text of a multi-page PDF. Each page is labeled as:
+You are given the full text of a multi-page PDF. Each page is labeled:
 
 === PAGE {number} ===
 {page content}
 
-Your task is to identify all segments of the document that contain tabular data.
+Your task is to identify every segment of the document that contains tabular data, classify each one, detect its column schema, and break it into named sub-sections.
 
-DEFINITION OF TABLE:
-A table is a structured set of repeated rows, typically containing:
+---
 
-* Columns such as "Description", "Quantity", "Unit Price", "Total", etc.
-* Multiple lines containing numeric values (decimals, currency)
-* Consistent row-like patterns
+DOCUMENT TYPES:
+- "detailed"  — line-item estimate with many rows per room/trade (most common)
+- "recap"     — only summary tables (room recap, trade recap, cost breakdown)
+- "mixed"     — contains both detailed line items AND recap tables
+
+TABLE TYPES:
+- "line_items"           — main estimate rows: description, qty, unit price, total
+- "room_recap"           — one row per room/area with subtotals
+- "trade_recap"          — one row per trade/category with subtotals
+- "materials_breakdown"  — materials cost table
+- "labor_breakdown"      — labor cost table
+- "equipment_breakdown"  — equipment/rental cost table
+
+---
 
 RULES:
 
-1. Identify ONLY pages that clearly contain tables.
+1. Identify ONLY pages that clearly contain tables (structured repeated rows with numeric values).
 
-2. Ignore:
+2. Ignore: cover pages, diagrams, floor plans, paragraph-only pages.
 
-   * Cover pages
-   * Diagrams / floor plans
-   * Paragraph-only pages
-   * Pages with only summaries unless they contain row-wise data
+3. Tables spanning multiple consecutive pages → group into one segment.
 
-3. Tables may span multiple pages:
+4. For each segment:
+   a. Set table_type based on the content.
+   b. Set column_schema to the ACTUAL column headers found in the document (e.g. ["Description", "Qty", "Unit Price", "RC", "Depreciation", "ACV"]).
+   c. Set sub_sections: named divisions within the segment (e.g. room names, category names). Each sub-section is a named block of rows with its own page range. If the table has no named divisions, use one sub-section covering the full segment range.
+   d. Set description to a short human-readable label for the segment.
 
-   * If consecutive pages continue the same table, group them together.
-   * Use signals like:
+5. NUMBER RANGE (line_items only):
+   Construction estimate PDFs use a sequential item counter that increments from 1 upward across the entire document (e.g. 1 … 619). Detect this range for every line_items sub-section.
 
-     * repeated headers
-     * similar row patterns
-     * continuation of numeric data
+   IMPORTANT — the text you receive is extracted from a PDF and may NOT have clean line breaks. The content of a page can appear as a continuous stream of words and numbers with inconsistent whitespace. Do NOT rely on newlines to find item boundaries.
 
-4. Output MUST group consecutive pages into segments.
+   Instead, scan the text of the sub-section's pages for this recurring pattern anywhere in the text flow:
+     <standalone integer>  <description words (no dollar signs, no units like EA/SF/LF)>
+   Examples of what to look for in the text:
+     "... 47 Paint walls and ceiling 2 EA ..."
+     "... 213 Custom cabinet installation ..."
+     "9 Add-on Delivery and Acclimation WOOD FLOORING ..."
+   The standalone integer that precedes description text is the item number.
+   It is NOT an item number if it is: a quantity ("2 EA"), a price ("$513"), a year, or part of a measurement.
 
-5. Be conservative:
+   Find the FIRST such item number in the sub-section pages → number_range.start
+   Find the LAST such item number in the sub-section pages → number_range.end
 
-   * If unsure about a page, exclude it.
+   Set number_range to {"start": N, "end": M}. If no such pattern exists at all, set null.
 
-6. DO NOT extract any data.
+6. Be conservative: if unsure about a page, exclude it.
 
-7. DO NOT summarize content.
+7. DO NOT extract any data values. Only identify structure.
 
-8. ONLY detect table segments.
+---
 
-OUTPUT FORMAT (STRICT JSON):
+OUTPUT FORMAT (strict JSON, no explanation):
 
 {
-"table_segments": [
-{
-"start_page": <number>,
-"end_page": <number>
-}
-]
+  "doc_type": "detailed|recap|mixed",
+  "table_segments": [
+    {
+      "start_page": <number>,
+      "end_page": <number>,
+      "table_type": "line_items|room_recap|trade_recap|materials_breakdown|labor_breakdown|equipment_breakdown",
+      "description": "short label for this segment",
+      "column_schema": ["Col1", "Col2", "Col3"],
+      "sub_sections": [
+        {
+          "name": "Sub-section Name",
+          "start_page": <number>,
+          "end_page": <number>,
+          "number_range": {"start": <number>, "end": <number>} | null
+        }
+      ]
+    }
+  ]
 }
 
-Return ONLY valid JSON. No explanations.
+Return ONLY valid JSON.
